@@ -138,6 +138,18 @@ void playFreshAlbumStart() {
     }
   }
 
+  // Pad any partial 512-byte block at the end of a short (< 8MB) album with silence
+  if (localPrimingFinished) {
+    uint32_t remainder = totalBytesWritten % 512;
+    if (remainder != 0) {
+      uint32_t padBytes = 512 - remainder;
+      if (totalBytesWritten + padBytes <= TOTAL_BUFFER_SIZE) {
+        memset(&circularAudioBuffer[totalBytesWritten], 0, padBytes);
+        totalBytesWritten += padBytes;
+      }
+    }
+  }
+
   ringWritePointer = totalBytesWritten % TOTAL_BUFFER_SIZE;
   ringReadPointer = 0;
   bankNeedRefill = false;
@@ -150,16 +162,15 @@ void playFreshAlbumStart() {
 
   isMediaPlaying = true;
   isMediaPaused = false;
-  nextTrackPreLaunched = false;
+  nextTrackPreLaunched = localPrimingFinished;
 
   activeEngineState = ENGINE_ACTIVE_PLAYING;
-  // updateTrackWindow(currentTrackIndex + 1, trackQueue[currentTrackIndex]);
-  Serial.printf("AUDIO ENGINE: Priming complete. Cached %lu continuous bytes.\n", totalBytesWritten);
+  Serial.printf("AUDIO ENGINE: Priming complete. Cached %lu continuous bytes (EOF=%d).\n", totalBytesWritten, localPrimingFinished);
 }
 
 // 🚀 THE ASYNCHRONOUS MICRO-SLICE BACKGROUND LOADER
 void processBackgroundSDFill() {
-  if (!bankNeedRefill) return;
+  if (!bankNeedRefill || nextTrackPreLaunched) return;
 
   uint32_t bankStartOffset = activeRefillBank * BANK_SIZE_BYTES;
   uint32_t sliceWriteAddress = bankStartOffset + currentBankWriteProgressBytes;
@@ -178,8 +189,19 @@ void processBackgroundSDFill() {
     }
   } else {
     if (!advanceToNextPlaylistFile()) {
+      uint32_t rawEndOffset = bankStartOffset + currentBankWriteProgressBytes;
+      uint32_t remainder = rawEndOffset % 512;
+      if (remainder != 0) {
+        uint32_t padBytes = 512 - remainder;
+        memset(&circularAudioBuffer[rawEndOffset], 0, padBytes);
+        rawEndOffset += padBytes;
+      }
+
+      ringWritePointer = rawEndOffset % TOTAL_BUFFER_SIZE;
+      currentBankWriteProgressBytes = 0;
       nextTrackPreLaunched = true;
       bankNeedRefill = false;
+      Serial.printf("AUDIO ENGINE: Final partial bank padded & committed. Aligned EOF ringWritePointer: %lu\n", ringWritePointer);
       return;
     }
   }
@@ -235,7 +257,6 @@ void updateAudioEngine() {
 
       if (activePlaybackTrackIndex != lastCalculatedIndex) {
         lastCalculatedIndex = activePlaybackTrackIndex;
-
         char trackPath[384];
         snprintf(trackPath, sizeof(trackPath), "%s/%s", currentAlbumAbsolutePath, trackQueue[activePlaybackTrackIndex]);
         File sizeFile = SD.open(trackPath);
@@ -246,45 +267,39 @@ void updateAudioEngine() {
           activeSongSizeBytes = 176400 * 180;
         }
       }
-
       // If our playback accumulator matches or exceeds the actual size profile of the track:
       if (absoluteTrackBytesPlayed >= activeSongSizeBytes && activePlaybackTrackIndex < (totalTracks - 1)) {
         activePlaybackTrackIndex++;
         absoluteTrackBytesPlayed = 0;
-
         // 🚀 THE INSULATION FIX: Do NOT draw text here! Just flag it and keep streaming samples!
         extern volatile bool uiTrackWindowNeedsRefresh;
         uiTrackWindowNeedsRefresh = true;
-
         Serial.printf("🔊 AUDIO TRANSITION: Advanced tracking index to %d. Flagged UI thread.\n", activePlaybackTrackIndex + 1);
       }
-
       // Maintain our separate static display string checker block for manual launches
       if (activePlaybackTrackIndex != lastTrackIndexTracked) {
         lastTrackIndexTracked = activePlaybackTrackIndex;
         absoluteTrackBytesPlayed = 0;
-
         extern volatile bool uiTrackWindowNeedsRefresh;
         uiTrackWindowNeedsRefresh = true;
       }
-
       ringReadPointer = (ringReadPointer + 512) % TOTAL_BUFFER_SIZE;
-
       // 🚀 THE DEFENSIVE SECURITY SHIELD:
-      // Changed exact equality checks (==) to boundary window gates (>=) to completely
-      // protect the rolling buffer from ever missing a background refill trigger!
-      if (ringReadPointer >= BANK_SIZE_BYTES && ringReadPointer < (BANK_SIZE_BYTES + 512) && !bankNeedRefill) {
-        activeRefillBank = 0;
-        currentBankWriteProgressBytes = 0;
-        bankNeedRefill = true;
-      } else if (ringReadPointer < 512 && ringReadPointer >= 0 && !bankNeedRefill) {
-        activeRefillBank = 1;
-        currentBankWriteProgressBytes = 0;
-        bankNeedRefill = true;
+      // Only trigger background refills while active album data still remains on SD
+      if (!nextTrackPreLaunched) {
+        if (ringReadPointer >= BANK_SIZE_BYTES && ringReadPointer < (BANK_SIZE_BYTES + 512) && !bankNeedRefill) {
+          activeRefillBank = 0;
+          currentBankWriteProgressBytes = 0;
+          bankNeedRefill = true;
+        } else if (ringReadPointer < 512 && ringReadPointer >= 0 && !bankNeedRefill) {
+          activeRefillBank = 1;
+          currentBankWriteProgressBytes = 0;
+          bankNeedRefill = true;
+        }
       }
     }
   }
-  if (isMediaPlaying && !isMediaPaused) {
+  if (isMediaPlaying && !isMediaPaused && !nextTrackPreLaunched) {
     processBackgroundSDFill();
   }
 }
