@@ -48,4 +48,6 @@ In order to get the file system to recognize your music, you MUST follow the art
 
 This exact format will tell the file sorting system that it's a chunk of data that should be treated as audio information and that it's the fifth track on the album.
 
+## Assembly
+
 (More README to come as things continue to approach a 1.0.0 release!!!)
